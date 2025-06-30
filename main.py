@@ -24,19 +24,15 @@ def pcm24_to_ulaw8(b64_pcm24: str) -> str:
     mulaw = audioop.lin2ulaw(downsampled.tobytes(), 2)
     return base64.b64encode(mulaw).decode()
 
-# -----------------------------------------------------------------------
-# Inbound audio: μ‑law 8 kHz ➜ PCM‑L16 24 kHz (duplicate‑sample up‑sample)
-UPSAMPLE_RATIO = 3  # 8 kHz → 24 kHz
+# --- sostituisci TUTTO il blocco che inizia con "Inbound audio" --------
+# Inbound audio: μ-law 8 kHz ➜ PCM-L16 24 kHz (quality up-sample)
 
 def ulaw8_to_pcm24(b64_ulaw: str) -> str:
-    """Convert base64 μ‑law 8 kHz → base64 PCM‑L16 24 kHz."""
+    """Convert base64 μ-law 8 kHz → base64 PCM-L16 24 kHz."""
     ulaw_bytes = base64.b64decode(b64_ulaw)
-    pcm8 = audioop.ulaw2lin(ulaw_bytes, 2)      # 16‑bit PCM @ 8 kHz
-    samples = array.array("h", pcm8)
-    upsampled = array.array("h")
-    for s in samples:
-        upsampled.extend([s, s, s])             # naïve 3× up‑sample
-    return base64.b64encode(upsampled.tobytes()).decode()
+    pcm8 = audioop.ulaw2lin(ulaw_bytes, 2)              # 16-bit PCM @ 8 kHz
+    pcm24, _ = audioop.ratecv(pcm8, 2, 1, 8_000, 24_000, None)
+    return base64.b64encode(pcm24).decode()
 
 
 # --- Agent‑specific prompts & voices ------------------------------------
@@ -50,7 +46,7 @@ AGENT_CONFIG = {
             "Offri due possibilità di richiamo: oggi alle 17:00 oppure domani alle 12:00. "
             "Chiedi quale preferisce, conferma la scelta e concludi educatamente."
         ),
-        "voice": "shimmer",  # OpenAI supported voice
+        "voice": "alloy",
     },
     "andrea": {
         "prompt": (
@@ -279,8 +275,8 @@ async def initialize_session(openai_ws, cfg):
         "type": "session.update",
         "session": {
             "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "pcm_l16",
-            "output_audio_format": "pcm_l16",   # linear‑PCM 16‑bit, 24 kHz
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
             "voice": cfg["voice"],
             "instructions": cfg["prompt"],
             "modalities": ["text", "audio"],
