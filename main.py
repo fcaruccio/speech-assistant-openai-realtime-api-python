@@ -14,13 +14,18 @@ load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
+SYSTEM_MESSAGE = os.getenv(
+    "SYSTEM_PROMPT",
+    (
+        "Sei l’assistente virtuale di Michela Radicchi. "
+        "Il tuo compito è parlare in italiano, essere cordiale e professionale, "
+        "e aiutare l’interlocutore a fissare un appuntamento telefonico con Michela "
+        "per verificare la sua situazione debitoria. "
+        "Offri due possibilità di richiamo: oggi alle 17:00 oppure domani alle 12:00. "
+        "Chiedi quale preferisce, conferma la scelta e concludi educatamente."
+    ),
 )
-VOICE = 'alloy'
+VOICE = 'melody'  # openai voice: femminile, calda
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -42,15 +47,32 @@ async def index_page():
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
-    response.say("Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API")
+    response.say(
+        "Salve! Sono l’assistente virtuale di Michela Radicchi. "
+        "La chiamo per fissare un appuntamento telefonico con Michela "
+        "e verificare insieme la sua situazione debitoria.",
+        language="it-IT",
+        voice="alice"
+    )
     response.pause(length=1)
-    response.say("O.K. you can start talking!")
+    response.say(
+        "Michela è disponibile oggi alle ore diciassette oppure domani alle ore dodici. "
+        "Quale di questi orari preferisce per essere richiamato?",
+        language="it-IT",
+        voice="alice"
+    )
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
+
+
+# Alias route for Twilio compatibility: /voice maps to the same handler as /incoming-call
+@app.api_route("/voice", methods=["GET", "POST"])
+async def voice_alias(request: Request):
+    # Simply reuse the existing logic for incoming calls
+    return await handle_incoming_call(request)
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -193,7 +215,11 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": (
+                        "Salve! Sono l’assistente virtuale di Michela Radicchi. "
+                        "Se desidera fissare un appuntamento o avere ulteriori informazioni, "
+                        "sono qui per aiutarla. Come posso assisterla?"
+                    )
                 }
             ]
         }
