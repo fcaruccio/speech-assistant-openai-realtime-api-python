@@ -3,8 +3,6 @@ import json
 import base64
 import asyncio
 import websockets
-import audioop
-import array
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -13,47 +11,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Audio conversion helpers -------------------------------------------
-RESAMPLE_RATIO = 3  # 24 kHz ➜ 8 kHz
-
-def pcm24_to_ulaw8(b64_pcm24: str) -> str:
-    """Convert base64‑encoded PCM16 24 kHz to base64 μ‑law 8 kHz."""
-    pcm_bytes = base64.b64decode(b64_pcm24)
-    samples = array.array("h", pcm_bytes)          # 16‑bit little‑endian
-    downsampled = samples[::RESAMPLE_RATIO]        # naive down‑sampling
-    mulaw = audioop.lin2ulaw(downsampled.tobytes(), 2)
-    return base64.b64encode(mulaw).decode()
-
-
-# --- Agent‑specific prompts & voices ------------------------------------
-AGENT_CONFIG = {
-    "michela": {
-        "prompt": (
-            "Sei l’assistente virtuale di Michela Radicchi. "
-            "Il tuo compito è parlare in italiano, essere cordiale e professionale, "
-            "e aiutare l’interlocutore a fissare un appuntamento telefonico con Michela "
-            "per verificare la sua situazione debitoria. "
-            "Offri due possibilità di richiamo: oggi alle 17:00 oppure domani alle 12:00. "
-            "Chiedi quale preferisce, conferma la scelta e concludi educatamente."
-        ),
-        "voice": "melody",
-    },
-    "andrea": {
-        "prompt": (
-            "Sei l'assistente di intelligenza artificiale di Francesco Caruccio "
-            "Parla sempre in italiano, tono amichevole e professionale, "
-            "Devi spiegare ad Andrea che questo è un prototipo di real time talking "
-            "basato sull'intelligenza artificiale. "
-            "Ricordagli che deve fissare l'analisi "
-            "E digli che lo saluti tanto e vi sentirete presto"
-        ),
-        "voice": "alloy",
-    },
-}
-
-# Configuration
+# Configuration – Andrea
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-PORT = int(os.getenv('PORT', 5050))
+PORT = int(os.getenv('PORT', 5051))      # porta diversa da Michela
+SYSTEM_MESSAGE = os.getenv(
+    "SYSTEM_PROMPT",
+    (
+        "Sei JARVIS l'intelligenza artificiale di Francesco Caruccio "
+        "Parla sempre in italiano, con tono amichevole e professionale. "
+        "Aiuta l’interlocutore a ricordargli che deve bloccare l'analisi "
+        "per assicurarsi un posto in prima fila per l'innovazione della sua azienda. "
+        "Ringrazialo ancora per la call che abbiamo avuto "
+        "Poi salutalo e riaggancia"
+    ),
+)
+VOICE = 'quinn'   # voce OpenAI – puoi cambiarla se preferisci
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -69,30 +41,28 @@ if not OPENAI_API_KEY:
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
-    return {"message": "Twilio Media Stream Server is running!"}
+    return {"message": "Twilio Media Stream Server – Andrea – is running!"}
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
-async def handle_incoming_call(request: Request, agent: str = "michela"):
-    cfg = AGENT_CONFIG.get(agent, AGENT_CONFIG["michela"])
+async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream?agent={agent}")
+    connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
-# Alias route for Twilio compatibility: /voice maps to the same handler as /incoming-call
+# Alias route for Twilio compatibility
 @app.api_route("/voice", methods=["GET", "POST"])
 async def voice_alias(request: Request):
-    # Simply reuse the existing logic for incoming calls
     return await handle_incoming_call(request)
 
 @app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
+async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
-    cfg = AGENT_CONFIG.get(agent, AGENT_CONFIG["michela"])
-    print("Client connected")
+    print("Client connected (Andrea)")
     await websocket.accept()
 
     async with websockets.connect(
@@ -102,9 +72,9 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
             "OpenAI-Beta": "realtime=v1"
         }
     ) as openai_ws:
-        await initialize_session(openai_ws, cfg)
+        await initialize_session(openai_ws)
 
-        # Connection specific state
+        # Connection-specific state
         stream_sid = None
         latest_media_timestamp = 0
         last_assistant_item = None
@@ -130,8 +100,6 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
-                        # Send initial greeting only after Twilio stream is ready
-                        await send_initial_conversation_item(openai_ws)
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
@@ -150,11 +118,12 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
                         print(f"Received event: {response['type']}", response)
 
                     if response.get('type') == 'response.audio.delta' and 'delta' in response:
+                        audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
                         audio_delta = {
                             "event": "media",
                             "streamSid": stream_sid,
                             "media": {
-                                "payload": pcm24_to_ulaw8(response["delta"])
+                                "payload": audio_payload
                             }
                         }
                         await websocket.send_json(audio_delta)
@@ -170,7 +139,6 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
 
                         await send_mark(websocket, stream_sid)
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
                     if response.get('type') == 'input_audio_buffer.speech_started':
                         print("Speech started detected.")
                         if last_assistant_item:
@@ -231,33 +199,38 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Ciao"
+                    "text": (
+                        "Salve! Sono l’assistente virtuale di Andrea Bianchi. "
+                        "Se desidera fissare un appuntamento o avere ulteriori informazioni, "
+                        "sono qui per aiutarla. Come posso assisterla?"
+                    )
                 }
             ]
         }
     }
     await openai_ws.send(json.dumps(initial_conversation_item))
-    # Tell OpenAI to generate the assistant's response
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
 
-async def initialize_session(openai_ws, cfg):
+async def initialize_session(openai_ws):
     """Control initial session with OpenAI."""
     session_update = {
         "type": "session.update",
         "session": {
             "turn_detection": {"type": "server_vad"},
             "input_audio_format": "g711_ulaw",
-            "output_audio_format": "pcm_l16",   # linear‑PCM 16‑bit, 24 kHz
-            "voice": cfg["voice"],
-            "instructions": cfg["prompt"],
+            "output_audio_format": "g711_ulaw",
+            "voice": VOICE,
+            "instructions": SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
         }
     }
-    print(f"Sending session update for agent '{cfg['voice']}':", json.dumps(session_update))
+    print('Sending session update (Andrea):', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
-    # Greeting will be sent after Twilio 'start' event; do not send here.
+
+    # Uncomment the next line to have the AI speak first
+    # await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
     import uvicorn
