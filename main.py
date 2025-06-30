@@ -24,6 +24,20 @@ def pcm24_to_ulaw8(b64_pcm24: str) -> str:
     mulaw = audioop.lin2ulaw(downsampled.tobytes(), 2)
     return base64.b64encode(mulaw).decode()
 
+# -----------------------------------------------------------------------
+# Inbound audio: μ‑law 8 kHz ➜ PCM‑L16 24 kHz (duplicate‑sample up‑sample)
+UPSAMPLE_RATIO = 3  # 8 kHz → 24 kHz
+
+def ulaw8_to_pcm24(b64_ulaw: str) -> str:
+    """Convert base64 μ‑law 8 kHz → base64 PCM‑L16 24 kHz."""
+    ulaw_bytes = base64.b64decode(b64_ulaw)
+    pcm8 = audioop.ulaw2lin(ulaw_bytes, 2)      # 16‑bit PCM @ 8 kHz
+    samples = array.array("h", pcm8)
+    upsampled = array.array("h")
+    for s in samples:
+        upsampled.extend([s, s, s])             # naïve 3× up‑sample
+    return base64.b64encode(upsampled.tobytes()).decode()
+
 
 # --- Agent‑specific prompts & voices ------------------------------------
 AGENT_CONFIG = {
@@ -36,7 +50,7 @@ AGENT_CONFIG = {
             "Offri due possibilità di richiamo: oggi alle 17:00 oppure domani alle 12:00. "
             "Chiedi quale preferisce, conferma la scelta e concludi educatamente."
         ),
-        "voice": "melody",
+        "voice": "shimmer",  # OpenAI supported voice
     },
     "andrea": {
         "prompt": (
@@ -121,7 +135,7 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
                         latest_media_timestamp = int(data['media']['timestamp'])
                         audio_append = {
                             "type": "input_audio_buffer.append",
-                            "audio": data['media']['payload']
+                            "audio": ulaw8_to_pcm24(data['media']['payload'])
                         }
                         await openai_ws.send(json.dumps(audio_append))
                     elif data['event'] == 'start':
@@ -143,13 +157,21 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            
+
+
+
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
-                    if response['type'] in LOG_EVENT_TYPES:
-                        print(f"Received event: {response['type']}", response)
+                    event_type = response.get("type")
 
-                    if response.get('type') == 'response.audio.delta' and 'delta' in response:
+                    # Log di servizio
+                    if event_type in LOG_EVENT_TYPES:
+                        print(f"Received event: {event_type}", response)
+
+                    # 1️⃣  Audio dell’assistente → Twilio
+                    if event_type == "response.audio.delta" and "delta" in response:
                         audio_delta = {
                             "event": "media",
                             "streamSid": stream_sid,
@@ -162,20 +184,30 @@ async def handle_media_stream(websocket: WebSocket, agent: str = "michela"):
                         if response_start_timestamp_twilio is None:
                             response_start_timestamp_twilio = latest_media_timestamp
                             if SHOW_TIMING_MATH:
-                                print(f"Setting start timestamp for new response: {response_start_timestamp_twilio}ms")
+                                print(f"Start timestamp for new response: {response_start_timestamp_twilio} ms")
 
-                        # Update last_assistant_item safely
-                        if response.get('item_id'):
-                            last_assistant_item = response['item_id']
+                        if response.get("item_id"):
+                            last_assistant_item = response["item_id"]
 
                         await send_mark(websocket, stream_sid)
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
-                    if response.get('type') == 'input_audio_buffer.speech_started':
+                    # 2️⃣  L’utente inizia a parlare (possibile barge‑in)
+                    elif event_type == "input_audio_buffer.speech_started":
                         print("Speech started detected.")
                         if last_assistant_item:
-                            print(f"Interrupting response with id: {last_assistant_item}")
+                            print(f"Interrupting response id {last_assistant_item}")
                             await handle_speech_started_event()
+
+                    # 3️⃣  L’utente ha finito di parlare: commit + risposta
+                    elif event_type == "input_audio_buffer.speech_stopped":
+                        # commit: trascrivi il parlato
+                        await openai_ws.send(json.dumps({
+                            "type": "input_audio_buffer.commit"
+                        }))
+                        # chiedi all’AI di rispondere
+                        await openai_ws.send(json.dumps({
+                            "type": "response.create"
+                        }))
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
 
@@ -247,7 +279,7 @@ async def initialize_session(openai_ws, cfg):
         "type": "session.update",
         "session": {
             "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "g711_ulaw",
+            "input_audio_format": "pcm_l16",
             "output_audio_format": "pcm_l16",   # linear‑PCM 16‑bit, 24 kHz
             "voice": cfg["voice"],
             "instructions": cfg["prompt"],
